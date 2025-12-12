@@ -7,6 +7,7 @@ import torch
 import uuid
 import numpy as np
 from typing import List
+from pydantic import BaseModel
 
 app = FastAPI()
 
@@ -21,6 +22,11 @@ model = CLIPModel.from_pretrained(MODEL_NAME)
 processor = CLIPProcessor.from_pretrained(MODEL_NAME)
 model.eval()
 print("Model Loaded!")
+
+#Request model for text search
+class TextSearchRequest(BaseModel):
+    query: str
+    top_k: int = 5
 
 @app.get("/")
 def home():
@@ -40,15 +46,23 @@ def get_image_embedding(image):
     # Convert to numpy array
     return embedding.cpu().numpy().flatten()
 
+def get_text_embedding(text: str):
+    """
+    Convert text to 512-dimensional vector
+    """
+    inputs = processor(text=[text], return_tensors="pt", padding=True)
+    with torch.no_grad():
+        embedding = model.get_text_features(**inputs)
+    
+    embedding = embedding / embedding.norm(dim=-1, keepdim=True)
+    return embedding.cpu().numpy().flatten()
+
 def cosine_similarity(vec1, vec2):
     """
     Calculate similarity between two vectors.
     Returns 0 to 1
     """
     return np.dot(vec1, vec2)
-
-
-
 
 @app.post("/upload")
 async def upload_image(file: UploadFile = File(...)):
@@ -145,6 +159,40 @@ def search_by_image(image_id: str, top_k: int = 5):
         "results": results[:top_k]
     }
 
+# Defines an API endpoint for searching images using a text query
+@app.post("/search/text")
+def search_by_text(request: TextSearchRequest):
+    query_embedding = get_text_embedding(request.query)
+
+    results = []
+    for filename in os.listdir("images"):
+        if not filename.endswith(".npy"):
+            continue
+        
+        current_id = filename.replace(".npy", "")
+        embedding = np.load(f"images/{filename}")
+        similarity = cosine_similarity(query_embedding, embedding)
+
+        image_file = None
+        for ext in ALLOWED_EXTENSIONS:
+            img_path = f"images/{current_id}.{ext}"
+            if os.path.exists(img_path):
+                image_file = f"{current_id}.{ext}"
+                break
+        
+        results.append({
+            "image_id": current_id,
+            "filename": image_file,
+            "similarity": float(similarity)
+        })
+    
+    results.sort(key=lambda x: x["similarity"], reverse=True)
+
+    return {
+        "query_text": request.query,
+        "results": results[:request.top_k]
+    }
+
 @app.get("/image/{filename}")
 def get_image(filename: str):
     """Serve image file"""
@@ -153,7 +201,17 @@ def get_image(filename: str):
         raise HTTPException(404, "image not found")
     return FileResponse(filepath)
 
-
+@app.get("/stats")
+def get_stats():
+    """Get database statistics"""
+    image_count = len([f for f in os.listdir("images") if not f.endswith(".npy")])
+    embedding_count = len([f for f in os.listdir("images") if f.endswith(".npy")])
+    
+    return {
+        "total_images": image_count,
+        "total_embeddings": embedding_count,
+        "status": "active"
+    }
 
 if __name__ == "__main__":
     import uvicorn
