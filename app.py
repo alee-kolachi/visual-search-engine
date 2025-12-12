@@ -40,6 +40,15 @@ def get_image_embedding(image):
     # Convert to numpy array
     return embedding.cpu().numpy().flatten()
 
+def cosine_similarity(vec1, vec2):
+    """
+    Calculate similarity between two vectors.
+    Returns 0 to 1
+    """
+    return np.dot(vec1, vec2)
+
+
+
 
 @app.post("/upload")
 async def upload_image(file: UploadFile = File(...)):
@@ -90,6 +99,61 @@ async def upload_image(file: UploadFile = File(...)):
         "embedding_file": embedding_file
     }
         
+@app.get("/search/image/{image_id}")
+def search_by_image(image_id: str, top_k: int = 5):
+    """
+    Find similar images to the given image_id
+    """
+    query_file = f"images/{image_id}.npy"
+    if not os.path.exists(query_file):
+        raise HTTPException(404, "Image not found")
+    
+    query_embedding = np.load(query_file)
+
+    #Get all embeddings
+    results = []
+    for filename in os.listdir("images"):
+        if not filename.endswith(".npy"):
+            continue
+
+        #Skip query image itself
+        current_id = filename.replace(".npy", "")
+        if current_id == image_id:
+            continue
+
+        #Load embedidng and calculate similarity
+        embedding = np.load(f"images/{filename}")
+        similarity = cosine_similarity(query_embedding, embedding)
+
+        #Find the image file
+        image_file = None
+        for ext in ALLOWED_EXTENSIONS:
+            img_path = f"images/{current_id}.{ext}"
+            if os.path.exists(img_path):
+                image_file = f"{current_id}.{ext}"
+                break
+
+        results.append({
+            "image_id": current_id,
+            "filename": image_file,
+            "similarity": float(similarity)
+        })
+    results.sort(key=lambda x: x["similarity"], reverse=True)
+
+    return {
+        "query_image_id": image_id,
+        "results": results[:top_k]
+    }
+
+@app.get("/image/{filename}")
+def get_image(filename: str):
+    """Serve image file"""
+    filepath = f"images/{filename}"
+    if not os.path.exists(filepath):
+        raise HTTPException(404, "image not found")
+    return FileResponse(filepath)
+
+
 
 if __name__ == "__main__":
     import uvicorn
