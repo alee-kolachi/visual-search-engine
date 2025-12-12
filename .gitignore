@@ -4,3 +4,4 @@ images/
 *.jpg
 *.png
 venv/
+chroma_db/
