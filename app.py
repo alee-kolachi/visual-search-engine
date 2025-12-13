@@ -1,4 +1,4 @@
-from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks
 from fastapi.responses import FileResponse
 import os
 from PIL import Image
@@ -9,6 +9,10 @@ import numpy as np
 from typing import List
 from pydantic import BaseModel
 import chromadb
+import zipfile
+import shutil
+from datetime import datetime
+
 
 app = FastAPI()
 
@@ -34,10 +38,17 @@ collection = chroma_client.get_or_create_collection(
 )
 print(f"ChromaDB ready. Images indexed: {collection.count()}")
 
+batch_status = {}
+
 #Request model for text search
 class TextSearchRequest(BaseModel):
     query: str
     top_k: int = 5
+
+class BatchUploadResponse(BaseModel):
+    job_id: str
+    message: str
+    status: str
 
 @app.get("/")
 def home():
@@ -130,6 +141,227 @@ async def upload_image(file: UploadFile = File(...)):
         "total_indexed": collection.count()
     }
         
+@app.post("/upload/batch", response_model=BatchUploadResponse)
+async def batch_upload(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...)
+):
+    if not file.filename.endswith(".zip"):
+        raise HTTPException(400, "Only .zip files allowed.")
+    
+    #Generate job id
+    job_id = str(uuid.uuid4())
+
+    #Save zip file
+    zip_path = f"images/batch_{job_id}.zip"
+    with open(zip_path, "wb") as f:
+        content = await file.read()
+        f.write(content)
+
+    #initialize job status
+    batch_status[job_id] = {
+        "status": "processing",
+        "total": 0,
+        "processed": 0,
+        "failed": 0,
+        "started_at": datetime.now().isoformat()
+    }
+
+    #Process in background (don't block response)
+    background_tasks.add_task(process_batch, job_id, zip_path)
+
+    return BatchUploadResponse(
+        job_id=job_id,
+        message="Batch processing started",
+        status="processing"
+    )
+
+def process_batch(job_id: str, zip_path: str):
+    extract_path = f"images/batch_{job_id}"
+    os.makedirs(extract_path, exist_ok=True)
+
+    try:
+        #Extract zip
+        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+            zip_ref.extractall(extract_path)
+        
+        image_files = []
+        for root, dirs, files in os.walk(extract_path):
+            for file in files:
+                ext = file.split(".")[-1].lower()
+                if ext in ALLOWED_EXTENSIONS:
+                    image_files.append(os.path.join(root, file))
+        
+        batch_status[job_id]["total"] = len(image_files)
+
+        #process each image
+        batch_embeddings = []
+        batch_ids = []
+        batch_metadatas = []
+
+        for img_path in image_files:
+            try:
+                #Load and process
+                img = Image.open(img_path)
+                if img.mode != "RGB":
+                    img = img.convert("RGB")
+                img = img.resize((224, 224), Image.Resampling.LANCZOS)
+
+                #Generate ID and save
+                image_id = str(uuid.uuid4())
+                ext = img_path.split(".")[-1].lower()
+                new_filename = f"{image_id}.{ext}"
+                new_path = f"images/{new_filename}"
+                img.save(new_path, quality=95)
+
+                #Extract embedding
+                embedding = get_image_embedding(img)
+
+                #Collect for batch insert
+                batch_ids.append(image_id)
+                batch_embeddings.append(embedding.tolist())
+                batch_metadatas.append({
+                    "filename": os.path.basename(img_path),
+                    "filepath": new_filename,
+                    "size": os.path.getsize(new_path),
+                    "batch_job": job_id
+                })
+
+                batch_status[job_id]["processed"] += 1
+
+                #Batch insert every 50 images
+                if len(batch_ids) >= 50:
+                    collection.add(
+                        ids=batch_ids,
+                        embeddings=batch_embeddings,
+                        metadatas=batch_metadatas
+                    )
+
+                    batch_ids = []
+                    batch_embeddings = []
+                    batch_metadatas = []
+            except Exception as e:
+                print(f"Failed to process {img_path}: {e}")
+                batch_status[job_id]["failed"] += 1
+
+        #Insert remaining images
+        if batch_ids:
+            collection.add(
+                ids=batch_ids,
+                embeddings=batch_embeddings,
+                metadatas=batch_metadatas
+            )
+
+        #Cleanup
+        shutil.rmtree(extract_path)
+        os.remove(zip_path)
+
+        batch_status[job_id]["status"] = "completed"
+        batch_status[job_id]["completed_at"] = datetime.now().isoformat()
+    except Exception as e:
+        batch_status[job_id]["status"] = "failed"
+        batch_status[job_id]["error"] = str(e)
+                
+@app.get("/batch/status/{job_id}")
+def get_batch_status(job_id: str):
+    """Check batch processing status"""
+    if job_id not in batch_status:
+        raise HTTPException(404, "Job not found")
+    
+    return batch_status[job_id]
+
+@app.post("/index/folder")
+async def index_folder(
+    background_tasks: BackgroundTasks,
+    folder_path: str
+):
+    if not os.path.exists(folder_path):
+        raise HTTPException(404, "Folder not found")
+    
+    job_id = str(uuid.uuid4())
+
+    batch_status[job_id] = {
+        "status": "processing",
+        "total": 0,
+        "processed": 0,
+        "failed": 0,
+        "started_at": datetime.now().isoformat()
+    }
+
+    background_tasks.add_task(process_folder, job_id, folder_path)
+
+    return {
+        "job_id": job_id,
+        "message": "folder indexing started",
+        "status": "processing"
+    }
+
+def process_folder(job_id: str, folder_path: str):
+    """Process all image in a  folder"""
+    image_files = []
+    for root, dirs, files in os.walk(folder_path):
+        for file in files:
+            ext = file.split(".")[-1].lower()
+            if ext in ALLOWED_EXTENSIONS:
+                image_files.append(os.path.join(root, file))
+    
+    batch_status[job_id]["total"] = len(image_files)
+
+    batch_embeddings = []
+    batch_ids = []
+    batch_metadatas = []
+
+    for img_path in image_files:
+        try:
+            img = Image.open(img_path)
+            if img.mode != "RGB":
+                img = img.convert("RGB")
+            img = img.resize((224, 224), Image.Resampling.LANCZOS)
+
+            image_id = str(uuid.uuid4())
+            ext = img_path.split(".")[-1].lower()
+            new_filename = f"{image_id}.{ext}"
+            new_path = f"images/{new_filename}"
+            img.save(new_path, quality=95)
+
+            embedding = get_image_embedding(img)
+
+            batch_ids.append(image_id)
+            batch_embeddings.append(embedding.tolist())
+            batch_metadatas.append({
+                "filename": os.path.basename(img_path),
+                "filepath": new_filename,
+                "size": os.path.getsize(new_path),
+                "batch_job": job_id
+            })
+
+            batch_status[job_id]["processed"] += 1
+
+            if len(batch_ids) >= 50:
+                collection.add(
+                    ids=batch_ids,
+                    embeddings=batch_embeddings,
+                    metadatas=batch_metadatas
+                )
+                batch_ids = []
+                batch_embeddings = []
+                batch_metadatas = []
+
+        except Exception as e:
+            print(f"Failed: {img_path}: {e}")
+            batch_status[job_id]["failed"] += 1
+
+    if batch_ids:
+        collection.add(
+            ids=batch_ids,
+            embeddings=batch_embeddings,
+            metadatas=batch_metadatas
+        )
+
+    batch_status[job_id]["status"] = "completed"
+    batch_status[job_id]["completed_at"] = datetime.now().isoformat()
+
+
 @app.get("/search/image/{image_id}")
 def search_by_image(image_id: str, top_k: int = 5):
     """
